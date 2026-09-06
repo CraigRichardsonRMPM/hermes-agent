@@ -62,9 +62,10 @@ def test_non_rate_limit_failure_is_not_retried(monkeypatch) -> None:
     assert sleeps == []
 
 
-def test_retry_stops_when_rate_limit_callback_opens_circuit(monkeypatch) -> None:
+def test_rate_limit_callback_runs_once_after_retries_are_exhausted(monkeypatch) -> None:
     calls = 0
     sleeps: list[float] = []
+    callback_errors: list[str] = []
 
     def rate_limited(_job):
         nonlocal calls
@@ -76,12 +77,14 @@ def test_retry_stops_when_rate_limit_callback_opens_circuit(monkeypatch) -> None
     result = scheduler._run_job_with_rate_limit_backoff(
         {"id": "job-1"},
         sleep=sleeps.append,
-        on_rate_limit=lambda _error: True,
+        jitter=lambda: 0.0,
+        on_rate_limit=lambda error: callback_errors.append(error) or True,
     )
 
     assert result[0] is False
-    assert calls == 1
-    assert sleeps == []
+    assert calls == 4
+    assert sleeps == [60.0, 120.0, 240.0]
+    assert callback_errors == ["RuntimeError: HTTP 429"]
 
 
 def test_breaker_trips_after_fleet_threshold_within_window(tmp_path) -> None:
