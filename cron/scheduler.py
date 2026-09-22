@@ -132,7 +132,12 @@ def _run_job_with_rate_limit_backoff(
     cap_delay: float | None = None,
     max_retries: int | None = None,
 ) -> tuple[bool, str, str, Optional[str]]:
-    """Retry rate-limit results and report only the terminal 429."""
+    """Retry rate-limit results and report only the terminal 429.
+
+    ``on_rate_limit`` is invoked once, after retries are exhausted (or
+    immediately for a hard usage limit), so callers record one failure per
+    completed job run rather than one failure per attempt.
+    """
     settings = _rate_limit_settings()
     sleep = sleep or time.sleep
     jitter = jitter or (lambda: random.uniform(0.0, 0.25))
@@ -166,12 +171,6 @@ def _run_job_with_rate_limit_backoff(
             retry_index + 1,
             max_retries,
         )
-        # Give the circuit-breaker callback first refusal on another retry:
-        # when it returns truthy the fleet breaker just opened, so sleeping
-        # and retrying would only add noise to an outage the breaker already
-        # owns.
-        if on_rate_limit is not None and on_rate_limit(result[3]):
-            return result
         sleep(delay)
         retry_index += 1
 
