@@ -15,6 +15,7 @@ import contextlib
 import contextvars
 import copy
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -24,7 +25,7 @@ import tempfile
 import time
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -72,6 +73,78 @@ COMPACTION_STATUS = f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier
 COMPACTION_HEARTBEAT_STATUS = f"🗜️ {COMPACTION_STATUS_MARKER} — still summarizing earlier conversation so I can continue..."
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+
+# Durable, bounded handoff evidence for successor sessions. Receipts live in
+# sessions.model_config so an in-place rewrite commits them atomically and a
+# rotated session carries them into its child. They contain references and
+# preservation classes, never message content.
+COMPACTION_RECEIPTS_MODEL_CONFIG_KEY = "compaction_receipts"
+_MAX_COMPACTION_RECEIPTS = 20
+
+
+def _compaction_message_ref(message: Any) -> str:
+    """Return a content-free stable reference for one boundary message."""
+    if isinstance(message, dict):
+        row_id = message.get("_row_id")
+        if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0:
+            return f"row:{row_id}"
+        payload = {
+            key: message.get(key)
+            for key in ("role", "content", "name", "tool_call_id", "tool_calls")
+            if key in message
+        }
+    else:
+        payload = message
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
+        "utf-8", errors="replace"
+    )
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()[:24]}"
+
+
+def _build_compaction_receipt(
+    *, attempt_id: str, trigger_source: str, pre_messages: list, post_messages: list,
+    compression_count: int, tail_messages: Optional[list], compressed_user_turn_outcome: str,
+    reinserted_last_assistant_reply: bool, timestamp: Optional[str] = None,
+) -> dict[str, Any]:
+    """Describe a committed compaction boundary without copying transcript content."""
+    pre_refs = {_compaction_message_ref(message) for message in pre_messages}
+    post_refs = [_compaction_message_ref(message) for message in post_messages]
+    verbatim_refs = list(dict.fromkeys(ref for ref in post_refs if ref in pre_refs))
+    tail_refs = {_compaction_message_ref(message) for message in (tail_messages or [])}
+    source = str(trigger_source or "auto")
+    return {
+        "schema_version": 1,
+        "attempt_id": attempt_id,
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "trigger": "policy" if source in {"manual", "policy"} else "budget",
+        "trigger_source": source,
+        "pre_compaction_head_ref": _compaction_message_ref(pre_messages[0]) if pre_messages else None,
+        "pre_message_count": len(pre_messages),
+        "post_message_count": len(post_messages),
+        "compression_count": int(compression_count),
+        "preserved": {
+            "verbatim_message_refs": verbatim_refs,
+            "verbatim_message_count": len(verbatim_refs),
+            "generated_or_rewritten_message_count": max(0, len(post_messages) - len(verbatim_refs)),
+            "verbatim_tail_count": sum(ref in tail_refs for ref in verbatim_refs),
+            "real_user_turn": compressed_user_turn_outcome,
+            "last_assistant_reply_reinserted": bool(reinserted_last_assistant_reply),
+        },
+    }
+
+
+def _next_compaction_receipts(agent: Any, receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read predecessor receipts and append one bounded successor-readable record."""
+    stored: Any = []
+    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+    getter = getattr(db, "get_session_model_config_value", None)
+    if session_id and callable(getter):
+        with _swallow("failed to read prior compaction receipts", exc_info=True):
+            stored = getter(session_id, COMPACTION_RECEIPTS_MODEL_CONFIG_KEY, [])
+    if not isinstance(stored, list):
+        stored = []
+    valid = [item for item in stored if isinstance(item, dict)]
+    return [*valid, receipt][-_MAX_COMPACTION_RECEIPTS:]
 
 
 def _strip_marker_for_comparison(msgs: Any) -> Any:
@@ -3305,6 +3378,7 @@ def _compression_child_source(agent: Any, parent_session_id: str) -> str:
 def _publish_rotated_compaction(
     agent: Any, messages: list, compressed: list, *, new_system_prompt: str, lease: _CompressionLease,
     old_session_id: str, compressed_user_turn_outcome: str,
+    compaction_receipts: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Rotate the session: flush the parent, publish the child, re-point the agent.
     Flushes current-turn msgs to the OLD session, passing the durable prefix (messages[:persist idx]) so
@@ -3338,10 +3412,13 @@ def _publish_rotated_compaction(
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from tools.approval_yolo import with_session_yolo
+    child_model_config = dict(with_session_yolo(agent._session_init_model_config, old_session_id) or {})
+    if compaction_receipts is not None:
+        child_model_config[COMPACTION_RECEIPTS_MODEL_CONFIG_KEY] = compaction_receipts
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
-        model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
+        model_config=child_model_config,
         system_prompt=new_system_prompt, messages=compressed,
         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
@@ -3421,7 +3498,7 @@ def _finish_compaction_boundary(
     agent: Any, compressed: list, *, new_system_prompt: str, old_session_id: Optional[str], in_place: bool,
     compacted_in_place: bool, session_commit_succeeded: bool, defer_context_engine_notification: bool,
     compression_made_progress: bool, compression_used_fallback: bool, compression_feasibility_skip: bool,
-    task_id: str,
+    task_id: str, compaction_receipt: Optional[dict[str, Any]],
 ) -> int:
     """Post-commit bookkeeping: notify engines/providers/hooks, re-arm usage tracking.
     Returns the rough post-compression token estimate (diagnostics only)."""
@@ -3477,8 +3554,12 @@ def _finish_compaction_boundary(
                     "platform": agent.platform or "", "session_id": agent.session_id,
                     "old_session_id": _old_sid or "", "in_place": in_place,
                     "compression_count": compressor.compression_count,
+                    "compaction_receipt": compaction_receipt,
                 },
             )
+
+    if compaction_receipt is not None:
+        logger.info("compaction receipt: %s", json.dumps(compaction_receipt, sort_keys=True, separators=(",", ":")))
 
     # Rotation-independent flag: the gateway uses it (not an id diff) to re-baseline
     # transcript handling (history_offset=0 + rewrite on the same id) in-place.
@@ -3603,6 +3684,7 @@ class _CommitOutcome:
     session_commit_succeeded: bool = False
     compacted_in_place: bool = False
     made_progress: bool = False
+    compaction_receipt: Optional[dict[str, Any]] = None
 
 
 def _held_watermark(agent: Any, watermark: Optional[int], messages: list, verbatim_tail: Optional[list]) -> Optional[int]:
@@ -3685,6 +3767,7 @@ def _commit_compaction(
     commit_started_at = time.monotonic()
     split_status = "not_applicable"
     old_session_id: Optional[str] = None  # bound only once rotation begins
+    compaction_receipt: Optional[dict[str, Any]] = None
     if agent._session_db:
         split_status = "pending"
         try:
@@ -3746,8 +3829,19 @@ def _commit_compaction(
                     agent._session_db, agent.session_id,
                     messages_before_compression if messages_before_compression is not None else messages,
                     verbatim_tail)
+                compaction_receipt = _build_compaction_receipt(
+                    attempt_id=attempt.attempt_id, trigger_source=attempt.trigger_source,
+                    pre_messages=messages_before_compression if messages_before_compression is not None else messages,
+                    post_messages=persisted, compression_count=agent.context_compressor.compression_count,
+                    tail_messages=verbatim_tail, compressed_user_turn_outcome=compressed_user_turn_outcome,
+                    reinserted_last_assistant_reply=bool(carried_messages),
+                )
+                receipt_history = _next_compaction_receipts(agent, compaction_receipt)
                 agent._session_db.archive_and_compact(
-                    agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
+                    agent.session_id, persisted, model_config_patch={
+                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                        COMPACTION_RECEIPTS_MODEL_CONFIG_KEY: receipt_history,
+                    },
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
                     lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
                     covered_ids=covered_ids, unresolved_held=unresolved_held,
@@ -3787,9 +3881,17 @@ def _commit_compaction(
                     # Publish the kept exchanges with the head, as the in-place branch stores them: the
                     # gateway no longer rewrites a published child, so a head-only handoff loses the tail.
                     compressed = rejoin_compressed_head_and_tail(compressed, verbatim_tail)
+                compaction_receipt = _build_compaction_receipt(
+                    attempt_id=attempt.attempt_id, trigger_source=attempt.trigger_source,
+                    pre_messages=messages_before_compression if messages_before_compression is not None else messages,
+                    post_messages=compressed, compression_count=agent.context_compressor.compression_count,
+                    tail_messages=verbatim_tail, compressed_user_turn_outcome=compressed_user_turn_outcome,
+                    reinserted_last_assistant_reply=bool(carried_messages),
+                )
                 _publish_rotated_compaction(
                     agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease,
                     old_session_id=old_session_id, compressed_user_turn_outcome=compressed_user_turn_outcome,
+                    compaction_receipts=_next_compaction_receipts(agent, compaction_receipt),
                 )
                 if verbatim_tail:
                     stamp_db_persisted_markers(verbatim_tail)
@@ -3852,6 +3954,7 @@ def _commit_compaction(
         compressed=compressed, commit_started_at=commit_started_at, old_session_id=old_session_id,
         split_status=split_status, session_commit_succeeded=session_commit_succeeded,
         compacted_in_place=compacted_in_place, made_progress=made_progress,
+        compaction_receipt=compaction_receipt,
     )
 
 
@@ -3963,6 +4066,8 @@ class _Attempt:
     snapshot: dict
     generation: int
     started_at: float
+    attempt_id: str
+    trigger_source: str
     durable_cooldown_authoritative: Optional[bool] = None
     durable_cooldown_state: Optional[dict[str, Any]] = None
 
@@ -4010,7 +4115,7 @@ def _begin_compression_attempt(
         agent.context_compressor._compression_telemetry_seed = {
             "attempt_id": attempt_id, "session_id": agent.session_id or "", "trigger_source": trigger,
         }
-    return _Attempt(snapshot, generation, started_at)
+    return _Attempt(snapshot, generation, started_at, attempt_id, trigger)
 
 
 def _route_codex_compaction(
@@ -4274,6 +4379,7 @@ def compress_context(
             defer_context_engine_notification=defer_context_engine_notification,
             compression_made_progress=commit.made_progress, compression_used_fallback=_compression_used_fallback,
             compression_feasibility_skip=_compression_feasibility_skip, task_id=task_id,
+            compaction_receipt=commit.compaction_receipt,
         )
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",

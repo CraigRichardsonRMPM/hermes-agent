@@ -122,6 +122,11 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+            receipts = db.get_session_model_config_value(sid, "compaction_receipts")
+            assert len(receipts) == 1
+            assert receipts[0]["trigger"] == "budget"
+            assert receipts[0]["pre_compaction_head_ref"].startswith("sha256:")
+            assert receipts[0]["preserved"]["real_user_turn"] == "already_present"
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
@@ -202,6 +207,10 @@ class TestRotationFallbackWhenFlagOff:
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
             ]
+            receipts = db.get_session_model_config_value(agent.session_id, "compaction_receipts")
+            assert len(receipts) == 1
+            assert receipts[0]["trigger"] == "budget"
+            assert receipts[0]["pre_message_count"] == 8
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
 

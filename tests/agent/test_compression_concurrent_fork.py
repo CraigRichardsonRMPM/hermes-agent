@@ -1004,7 +1004,13 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
     assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
         message["content"] for message in compressed
     ]
-    assert json.loads(db.get_session(session_id)["model_config"]) == {"keep": "value"}
+    session_row = db.get_session(session_id)
+    assert session_row is not None
+    model_config = json.loads(session_row["model_config"])
+    assert model_config["keep"] == "value"
+    assert "_proactive_prune_rearm_tokens" not in model_config
+    assert len(model_config["compaction_receipts"]) == 1
+    assert model_config["compaction_receipts"][0]["trigger"] == "budget"
 
 def test_rotation_child_starts_without_durable_prune_runway(tmp_path: Path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
